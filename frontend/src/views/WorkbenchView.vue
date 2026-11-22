@@ -60,6 +60,24 @@
             >
               {{ action }}
             </button>
+            <button
+              v-if="meta.key === 'segment_compare'"
+              class="link"
+              type="button"
+              :data-testid="`open-overlap-${row.id}`"
+              @click="openOverlap(Number(row.id))"
+            >
+              对照重叠
+            </button>
+            <button
+              v-if="meta.key === 'user_cohort'"
+              class="link"
+              type="button"
+              :data-testid="`publish-snapshot-${row.id}`"
+              @click="openSnapshot(Number(row.id))"
+            >
+              发布名单快照
+            </button>
           </td>
         </tr>
         <tr v-if="!rows.length">
@@ -69,6 +87,36 @@
         </tr>
       </tbody>
     </table>
+
+    <OverlapViewPanel
+      v-if="meta.key === 'segment_compare' && overlapTaskId"
+      :task-id="overlapTaskId"
+      :key="overlapTaskId"
+    />
+
+    <div v-if="showSnapshot" class="modal-backdrop" data-testid="snapshot-modal">
+      <form class="modal" @submit.prevent="submitSnapshot">
+        <h3>发布分群名单快照</h3>
+        <p class="page-desc">
+          每提交一次都会追加一版不可变快照；留空提交即发布空名单，已发起的对比与评估仍读原版本。
+        </p>
+        <label class="create-field">
+          <span>成员 ID（每行一个）</span>
+          <textarea
+            v-model="snapshotMembers"
+            data-testid="snapshot-members"
+            rows="5"
+            placeholder="u1&#10;u2"
+          />
+        </label>
+        <div class="page-actions">
+          <button class="btn" type="button" @click="showSnapshot = false">取消</button>
+          <button class="btn primary" data-testid="submit-snapshot" type="submit" :disabled="publishing">
+            {{ publishing ? '发布中…' : '发布快照' }}
+          </button>
+        </div>
+      </form>
+    </div>
 
     <div v-if="showCreate" class="modal-backdrop" data-testid="create-modal">
       <form class="modal" @submit.prevent="submitCreate">
@@ -101,8 +149,10 @@ import {
   downloadEntries,
   listEntries,
   moduleMeta,
+  recomputeCohortWithMembers,
   runAction as applyAction,
 } from '@/api/backend-service'
+import OverlapViewPanel from '@/components/OverlapViewPanel.vue'
 import type { EntryRow } from '@/data/types'
 
 const props = defineProps<{ moduleKey: string }>()
@@ -115,6 +165,11 @@ const filterFields = meta.fields.slice(0, 3)
 const showCreate = ref(false)
 const creating = ref(false)
 const createValues = ref<Record<string, string>>({})
+const overlapTaskId = ref<number | null>(null)
+const showSnapshot = ref(false)
+const snapshotCohortId = ref<number | null>(null)
+const snapshotMembers = ref('')
+const publishing = ref(false)
 const stats = computed(() => [
   { label: meta.metrics[0], value: total.value },
   { label: meta.metrics[1], value: rows.value.filter((row) => row.status === meta.statuses[1]).length },
@@ -162,6 +217,37 @@ async function submitCreate() {
     errorMessage.value = error instanceof Error ? error.message : '登记失败'
   } finally {
     creating.value = false
+  }
+}
+
+function openOverlap(taskId: number) {
+  errorMessage.value = ''
+  overlapTaskId.value = taskId
+}
+
+function openSnapshot(cohortId: number) {
+  errorMessage.value = ''
+  snapshotCohortId.value = cohortId
+  snapshotMembers.value = ''
+  showSnapshot.value = true
+}
+
+async function submitSnapshot() {
+  if (snapshotCohortId.value === null) return
+  publishing.value = true
+  errorMessage.value = ''
+  try {
+    const memberIds = snapshotMembers.value
+      .split(/\r?\n|,/)
+      .map((value) => value.trim())
+      .filter(Boolean)
+    await recomputeCohortWithMembers(snapshotCohortId.value, memberIds)
+    showSnapshot.value = false
+    await reload()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '快照发布失败'
+  } finally {
+    publishing.value = false
   }
 }
 

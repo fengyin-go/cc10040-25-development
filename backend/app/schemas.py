@@ -29,3 +29,10 @@ class EntryPayload(BaseModel):
 class ActionPayload(BaseModel):
     action: str
     remark: str | None = None
+
+
+class CohortRecomputePayload(BaseModel):
+    """分群重算入参：显式名单（可为空）优先，否则按人数模拟计算。"""
+
+    member_ids: list[str] | None = None
+    group_size: int | None = None

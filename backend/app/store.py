@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import time
 import threading
+import uuid
 from typing import Any
 
 from app.seed import SEED_ROWS
@@ -15,21 +16,46 @@ from app.seed import SEED_ROWS
 class Store:
     def __init__(self) -> None:
         self._tables: dict[str, list[dict[str, Any]]] = {
-            name: [dict(row) for row in rows] for name, rows in SEED_ROWS.items()
+            name: [dict(row) for row in rows]
+            for name, rows in SEED_ROWS.items()
+            if name != "cohort_snapshot"
         }
         self._id_counters: dict[str, int] = {}
         # Cache layer storage
         self._cache: dict[str, tuple[float, Any]] = {}
         # Cross-module journal
         self._query_log: list[dict[str, Any]] = []
-        # Cohort snapshots
+        # Cohort snapshots: cohort_id -> {snapshot_id} 当前版本指针
         self._cohort_snapshots: dict[str, list[dict[str, Any]]] = {}
+        # Versioned cohort snapshots: snapshot_id -> snapshot record
+        self._snapshot_registry: dict[str, dict[str, Any]] = {}
+        # 分群对比分析产出的对照重叠视图（按对比任务保留历次分析）
+        self._overlap_views: dict[int, list[dict[str, Any]]] = {}
+        self._overlap_analyses: dict[str, dict[str, Any]] = {}
+        # 实验分群基于对照重叠视图产出的评估明细: evaluation_id -> record
+        self._experiment_evaluations: dict[str, dict[str, Any]] = {}
         # Anomaly records
         self._anomaly_records: list[dict[str, Any]] = []
         # Recalc history
         self._recalc_history: list[dict[str, Any]] = []
         # Lock for thread safety
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._load_seed_snapshots()
+
+    def _load_seed_snapshots(self) -> None:
+        for row in SEED_ROWS.get("cohort_snapshot", []):
+            cohort_id = str(row["cohort_id"])
+            snapshot_id = str(row["snapshot_id"])
+            self._snapshot_registry[snapshot_id] = {
+                "snapshot_id": snapshot_id,
+                "cohort_id": int(cohort_id),
+                "cohort_name": row.get("cohort_name", ""),
+                "group_size": len(row.get("members", [])),
+                "members": [dict(member) for member in row.get("members", [])],
+                "member_ids": [str(member_id) for member_id in row.get("member_ids", [])],
+                "created_at": row.get("created_at", ""),
+            }
+            self._cohort_snapshots[cohort_id] = [{"snapshot_id": snapshot_id}]
 
     @property
     def lock(self):
@@ -132,16 +158,117 @@ class Store:
 
     # ── Cohort operations ──
 
-    def save_cohort_snapshot(self, cohort_id: int, members: list[dict[str, Any]]) -> None:
-        self._cohort_snapshots[str(cohort_id)] = members
+    def save_cohort_snapshot(
+        self,
+        cohort_id: int,
+        members: list[dict[str, Any]],
+        *,
+        cohort_name: str = "",
+        group_size: int | None = None,
+    ) -> str:
+        """发布一份新的分群成员快照，返回快照版本号。
+
+        快照一旦发布就是不可变的：旧的对比分析、实验评估持有快照版本号，
+        后续重算只会追加新版本，不会原地覆盖它们正在读的成员样本。
+        """
+        snapshot_id = f"snap-{cohort_id}-{uuid.uuid4().hex[:8]}"
+        created_at = time.strftime("%Y-%m-%d %H:%M:%S")
+        frozen_members = [dict(member) for member in members]
+        snapshot = {
+            "snapshot_id": snapshot_id,
+            "cohort_id": cohort_id,
+            "cohort_name": cohort_name,
+            "group_size": int(group_size if group_size is not None else len(frozen_members)),
+            "members": frozen_members,
+            "member_ids": [str(member.get("user_id", "")) for member in frozen_members],
+            "created_at": created_at,
+        }
+        self._snapshot_registry[snapshot_id] = snapshot
+        # 分群当前快照指针指向最新版本；历史版本仍可按版本号读取。
+        self._cohort_snapshots[str(cohort_id)] = [{"snapshot_id": snapshot_id}]
+        return snapshot_id
 
     def get_cohort_snapshot(self, cohort_id: int) -> list[dict[str, Any]] | None:
-        return self._cohort_snapshots.get(str(cohort_id))
+        """读取分群当前（最新）快照的成员列表。"""
+        latest = self.get_latest_snapshot_id(cohort_id)
+        if latest is None:
+            return None
+        snapshot = self._snapshot_registry.get(latest)
+        return list(snapshot["members"]) if snapshot else None
+
+    def get_latest_snapshot_id(self, cohort_id: int) -> str | None:
+        current = self._cohort_snapshots.get(str(cohort_id))
+        if not current:
+            return None
+        return current[0].get("snapshot_id")
+
+    def get_snapshot(self, snapshot_id: str | None) -> dict[str, Any] | None:
+        """按快照版本号读取快照，返回副本，避免调用方改写历史版本。"""
+        if not snapshot_id:
+            return None
+        snapshot = self._snapshot_registry.get(snapshot_id)
+        if snapshot is None:
+            return None
+        return {
+            **snapshot,
+            "members": [dict(member) for member in snapshot["members"]],
+            "member_ids": list(snapshot["member_ids"]),
+        }
+
+    def snapshot_versions(self, cohort_id: int) -> list[dict[str, Any]]:
+        """列出一个分群发布过的全部快照版本（按发布顺序）。"""
+        return [
+            {"snapshot_id": snapshot["snapshot_id"],
+             "created_at": snapshot["created_at"],
+             "group_size": snapshot["group_size"],
+             "member_count": len(snapshot["members"])}
+            for snapshot in self._snapshot_registry.values()
+            if snapshot["cohort_id"] == cohort_id
+        ]
+
+    # ── 对照重叠视图 / 实验评估 ──
+
+    def save_overlap_view(self, task_id: int, view: dict[str, Any]) -> dict[str, Any]:
+        """保存分群对比分析算出的对照重叠视图（每次分析追加一版）。"""
+        view = {**view, "task_id": int(task_id)}
+        self._overlap_views.setdefault(int(task_id), []).append(view)
+        self._overlap_analyses[view["analysis_id"]] = view
+        return view
+
+    def overlap_views(self, task_id: int) -> list[dict[str, Any]]:
+        return list(self._overlap_views.get(int(task_id), []))
+
+    def get_overlap_view(self, task_id: int) -> dict[str, Any] | None:
+        """取该对比任务最近一次分析的对照重叠视图。"""
+        views = self._overlap_views.get(int(task_id))
+        return views[-1] if views else None
+
+    def get_overlap_analysis(self, analysis_id: str) -> dict[str, Any] | None:
+        """按分析版本读取对照重叠视图（旧分析可按原版本复核）。"""
+        return self._overlap_analyses.get(analysis_id)
+
+    def save_experiment_evaluation(self, evaluation_id: str,
+                                   evaluation: dict[str, Any]) -> dict[str, Any]:
+        self._experiment_evaluations[evaluation_id] = evaluation
+        return evaluation
+
+    def get_experiment_evaluation(self, evaluation_id: str) -> dict[str, Any] | None:
+        return self._experiment_evaluations.get(evaluation_id)
+
+    def experiment_evaluations(self) -> list[dict[str, Any]]:
+        return list(self._experiment_evaluations.values())
 
     # ── Anomaly detection operations ──
 
     def record_anomaly(self, metric_id: int, severity: str, description: str,
-                       value: float, threshold: float) -> dict[str, Any]:
+                       value: float, threshold: float,
+                       *,
+                       source: str = "anomaly_detector",
+                       task_id: int | None = None,
+                       snapshot_id: str | None = None,
+                       snapshot_ids: dict[str, str] | None = None,
+                       evaluation_id: str | None = None,
+                       analysis_id: str | None = None) -> dict[str, Any]:
         record = {
             "id": len(self._anomaly_records) + 1,
             "指标ID": metric_id,
@@ -150,6 +277,12 @@ class Store:
             "当前值": value,
             "阈值": threshold,
             "时间": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "source": source,
+            "task_id": task_id,
+            "snapshot_id": snapshot_id,
+            "snapshot_ids": dict(snapshot_ids or {}),
+            "evaluation_id": evaluation_id,
+            "analysis_id": analysis_id,
         }
         self._anomaly_records.append(record)
         return record

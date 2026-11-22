@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
+from app.schemas import CohortRecomputePayload
 from app.services.metric_definition import MetricDefinitionService
 from app.services.caliber_version import CaliberVersionService
 from app.services.query_builder import QueryBuilderService
@@ -184,10 +185,28 @@ def generate_report(template_id: int):
 # ── 链3: 分群对比异常链 ──
 
 @router.post("/user-cohort/{cohort_id}/recompute")
-def recompute_cohort(cohort_id: int):
-    """重新计算分群"""
+def recompute_cohort(
+    cohort_id: int,
+    member_ids: list[str] | None = None,
+    group_size: int | None = None,
+):
+    """重新计算分群；可显式发布指定成员名单（含空名单）或指定人数。"""
     svc = UserCohortService()
-    return svc.recompute_cohort(cohort_id)
+    members = None
+    if member_ids is not None:
+        members = [{"user_id": str(member_id)} for member_id in member_ids]
+    return svc.recompute_cohort(cohort_id, members=members, group_size=group_size)
+
+
+@router.post("/user-cohort/{cohort_id}/snapshot")
+def recompute_cohort_snapshot(cohort_id: int, payload: CohortRecomputePayload):
+    """以 JSON 请求体发布分群快照；``member_ids: []`` 就是发布空名单。"""
+    svc = UserCohortService()
+    members = None
+    if payload.member_ids is not None:
+        members = [{"user_id": str(member_id)} for member_id in payload.member_ids]
+    return svc.recompute_cohort(
+        cohort_id, members=members, group_size=payload.group_size)
 
 
 @router.get("/user-cohort/{cohort_id}/detail")
@@ -206,16 +225,89 @@ def evaluate_experiment_groups(group_a_id: int, group_b_id: int):
 
 @router.post("/segment-compare/{task_id}/execute")
 def execute_segment_compare(task_id: int):
-    """执行分群对比分析"""
+    """执行分群对比分析，产出对照重叠视图"""
     svc = SegmentCompareService()
     return svc.execute_compare(task_id)
 
 
-@router.get("/segment-compare/{task_id}/insights")
-def segment_compare_insights(task_id: int):
-    """获取跨分群洞察"""
+@router.get("/segment-compare/{task_id}/overlap")
+def segment_compare_overlap(task_id: int, analysis_id: str | None = None):
+    """读取对照重叠视图：默认最近一次完成的分析，可按分析版本复核"""
     svc = SegmentCompareService()
-    return svc.get_cross_segment_insights(task_id)
+    view = svc.get_overlap_view(task_id, analysis_id)
+    if view is None:
+        return {"error": f"对比任务 {task_id} 还没有对照重叠视图"}
+    return view
+
+
+@router.get("/segment-compare/{task_id}/insights")
+def segment_compare_insights(task_id: int, analysis_id: str | None = None):
+    """获取跨分群洞察（默认同一对比最近一次完成的分析产生的失衡）"""
+    svc = SegmentCompareService()
+    return svc.get_cross_segment_insights(task_id, analysis_id)
+
+
+@router.get("/segment-compare/{task_id}/anomalies")
+def segment_compare_anomaly_history(task_id: int, snapshot_id: str | None = None):
+    """按对比任务和快照版本追查历史失衡告警明细"""
+    svc = SegmentCompareService()
+    history = svc.get_anomaly_history(task_id, snapshot_id)
+    if history is None:
+        return {"error": f"对比任务 {task_id} 不存在"}
+    return history
+
+
+@router.post("/experiment-group/evaluate-overlap/{task_id}")
+def evaluate_overlap(
+    task_id: int,
+    analysis_id: str | None = None,
+    group_a_id: int | None = None,
+    group_b_id: int | None = None,
+):
+    """沿对照重叠视图发起并完成实验评估，计算对照比例并生成评估明细"""
+    svc = ExperimentGroupService()
+    return svc.evaluate_overlap(
+        task_id, analysis_id=analysis_id,
+        group_a_id=group_a_id, group_b_id=group_b_id)
+
+
+@router.post("/experiment-group/evaluate-overlap/{task_id}/start")
+def start_overlap_evaluation(
+    task_id: int,
+    analysis_id: str | None = None,
+    group_a_id: int | None = None,
+    group_b_id: int | None = None,
+):
+    """发起评估但先不完成，用于验证评估期间并发重算不改变已绑定的快照版本"""
+    svc = ExperimentGroupService()
+    return svc.start_overlap_evaluation(
+        task_id, analysis_id=analysis_id,
+        group_a_id=group_a_id, group_b_id=group_b_id)
+
+
+@router.post("/experiment-group/evaluations/{evaluation_id}/complete")
+def complete_overlap_evaluation(evaluation_id: str):
+    """完成评估：按发起时锁定的快照版本计算"""
+    svc = ExperimentGroupService()
+    return svc.complete_overlap_evaluation(evaluation_id)
+
+
+@router.get("/experiment-group/evaluations/{evaluation_id}")
+def experiment_evaluation_detail(evaluation_id: str):
+    """读取评估明细"""
+    svc = ExperimentGroupService()
+    evaluation = svc.get_evaluation(evaluation_id)
+    if evaluation is None:
+        return {"error": f"评估 {evaluation_id} 不存在"}
+    return evaluation
+
+
+@router.get("/experiment-group/evaluations")
+def experiment_evaluation_list(task_id: int | None = None):
+    """列出评估明细，可按对比任务过滤"""
+    svc = ExperimentGroupService()
+    evaluations = svc.list_evaluations(task_id)
+    return {"items": evaluations, "total": len(evaluations)}
 
 
 @router.post("/anomaly-detector/{rule_id}/detect")

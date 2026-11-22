@@ -71,6 +71,37 @@ npm run dev
 | 口径重算引擎 | `recalc_engine` | 重算任务 | 关联指标、新口径版本、历史时间范围 |
 | 字段血缘 | `field_lineage` | 字段血缘 | 目标字段、来源字段列表、转换逻辑 |
 
+## 分群对照重叠与实验评估
+
+链3 的成员级分析（`segment_compare` → `experiment_group`）：
+
+- **分群对比分析**执行时读取 A/B 两组成员快照，产出「对照重叠视图」：
+  交集成员单独列出，并给出两组各自的独立人数和去重后的可观测人数。
+  交集只算一次观测，不会把共用成员当成两次独立观测。
+- 每次执行都会绑定两份不可变快照版本；重算并发发布新快照（含空名单）
+  不会改写已在进行的对比和评估。
+- **实验分群**读取对照重叠视图，按实际可比成员计算对照比例，
+  评估明细里同时展示两组样本数量、交集和各自的快照版本。
+  评估分两步（`/start` 锁定版本、`/complete` 按锁定版本计算），
+  所以「评估中」期间发布的空名单只会进入之后的新对比。
+- **跨分群洞察**只展示同一对比最近一次完成分析的失衡；
+  旧失衡可按对比任务 + 快照版本通过 `/anomalies?snapshot_id=` 追查。
+
+相关接口：
+
+| 接口 | 说明 |
+| --- | --- |
+| `POST /api/cross/user-cohort/{id}/snapshot` | 发布名单快照，`{"member_ids": []}` 即空名单 |
+| `POST /api/cross/segment-compare/{id}/execute` | 执行对比并生成对照重叠视图 |
+| `GET /api/cross/segment-compare/{id}/overlap` | 读取重叠视图（可带 `analysis_id` 复核旧分析） |
+| `POST /api/cross/experiment-group/evaluate-overlap/{id}[/start]` | 沿视图发起评估（`/start` 只发起不完成） |
+| `POST /api/cross/experiment-group/evaluations/{id}/complete` | 按发起时锁定的快照完成评估 |
+| `GET /api/cross/segment-compare/{id}/insights` | 跨分群洞察（最新分析的失衡） |
+| `GET /api/cross/segment-compare/{id}/anomalies?snapshot_id=` | 按快照版本追查旧告警 |
+
+前端：分群对比分析列表每行有「对照重叠」入口，打开重叠视图面板；
+用户分群列表每行有「发布名单快照」入口，可发布指定名单或空名单。
+
 ## 约定
 
 - 全部模块共享`frontend/src/views/WorkbenchView.vue|tsx`和一套资源路由。

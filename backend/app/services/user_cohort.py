@@ -22,11 +22,21 @@ class UserCohortService(BaseModuleService):
     ACTION_RULES = {"重新计算": "已生成", "标记失效": "已失效"}
     NEGATIVE_ACTIONS = []
 
-    def recompute_cohort(self, entry_id: int) -> dict[str, Any] | None:
-        """重新计算分群，生成最新的用户列表快照。
+    def recompute_cohort(
+        self,
+        entry_id: int,
+        *,
+        members: list[dict[str, Any]] | None = None,
+        group_size: int | None = None,
+    ) -> dict[str, Any] | None:
+        """重新计算分群，发布一版新的用户列表快照。
 
         跨模块数据流: user_cohort -> experiment_group（实验分群引用）
                      user_cohort -> segment_compare（对比分析引用）
+
+        快照是追加发布的：已在进行的对比分析、实验评估仍按它们绑定的旧版本读，
+        新版本只被后续新发起的分析看到。显式传 ``members`` 可发布指定名单
+        （包括空名单），否则按分群登记人数模拟计算。
         """
         cohort = store.find(self.MODULE, entry_id)
         if cohort is None:
@@ -34,18 +44,22 @@ class UserCohortService(BaseModuleService):
 
         cohort_name = cohort.get("分群名称", "")
         condition = cohort.get("分群条件", "")
-        try:
-            group_size = int(cohort.get("群组大小", "100"))
-        except (ValueError, TypeError):
-            group_size = 100
 
-        # 模拟分群计算 - 真实项目会查询数据源
-        members = [
-            {"user_id": f"U{i+1000}", "name": f"用户{i+1}",
-             "cohort": cohort_name, "condition": condition,
-             "join_time": time.strftime("%Y-%m-%d")}
-            for i in range(min(group_size, 100))
-        ]
+        if members is None:
+            if group_size is None:
+                try:
+                    group_size = int(cohort.get("群组大小", "100"))
+                except (ValueError, TypeError):
+                    group_size = 100
+            # 模拟分群计算 - 真实项目会查询数据源
+            members = [
+                {"user_id": f"U{i+1000}", "name": f"用户{i+1}",
+                 "cohort": cohort_name, "condition": condition,
+                 "join_time": time.strftime("%Y-%m-%d")}
+                for i in range(min(max(0, int(group_size)), 100))
+            ]
+        else:
+            members = [dict(member) for member in members]
 
         # 更新分群基本信息
         cohort["群组大小"] = str(len(members))
@@ -53,8 +67,10 @@ class UserCohortService(BaseModuleService):
         cohort["status"] = "已生成"
         cohort["pending"] = False
 
-        # 保存快照
-        store.save_cohort_snapshot(entry_id, members)
+        # 追加一版不可变快照
+        snapshot_id = store.save_cohort_snapshot(
+            entry_id, members, cohort_name=cohort_name, group_size=len(members))
+        cohort["latest_snapshot_id"] = snapshot_id
 
         # 检查是否有引用的实验分组需要更新
         experiment_refs = store.find_by_field("experiment_group", "筛选条件", cohort_name)
@@ -65,6 +81,7 @@ class UserCohortService(BaseModuleService):
             "cohort_name": cohort_name,
             "condition": condition,
             "member_count": len(members),
+            "snapshot_id": snapshot_id,
             "updated_at": cohort.get("最近更新时间"),
             "affected_experiments": affected_experiments,
             "sample_members": members[:5],
@@ -81,6 +98,7 @@ class UserCohortService(BaseModuleService):
 
         cohort = cohort_data["cohort"]
         members = store.get_cohort_snapshot(entry_id)
+        latest_snapshot_id = store.get_latest_snapshot_id(entry_id)
 
         return {
             "cohort_id": entry_id,
@@ -90,6 +108,8 @@ class UserCohortService(BaseModuleService):
             "update_frequency": cohort.get("更新频率"),
             "status": cohort.get("status"),
             "member_count": len(members) if members else 0,
+            "latest_snapshot_id": latest_snapshot_id,
+            "snapshot_versions": store.snapshot_versions(entry_id),
             "referenced_by_experiments": [
                 {"name": e.get("规则名称"), "id": e.get("id")}
                 for e in cohort_data["experiments"]
